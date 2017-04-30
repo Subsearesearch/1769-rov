@@ -1,0 +1,25 @@
+16:48:17 **** Incremental Build of configuration Debug for project ROV_Controller_Prototype ****
+make -r all 
+Building file: ../src/ROV_Controller_Prototype.c
+Invoking: MCU C Compiler
+arm-none-eabi-gcc -DDEBUG -DCORE_M3 -D__CODE_RED -D__USE_LPCOPEN -D__LPC17XX__ -D__REDLIB__ -I"C:\Users\Joey\Documents\LPCXpresso_8.2.2_650\MATE_Workspace\wstest\lpc_board_nxp_lpcxpresso_1769\inc" -I"C:\Users\Joey\Documents\LPCXpresso_8.2.2_650\MATE_Workspace\wstest\lpc_chip_175x_6x\inc" -O0 -fno-common -g3 -Wall -c -fmessage-length=0 -fno-builtin -ffunction-sections -fdata-sections -mcpu=cortex-m3 -mthumb -specs=redlib.specs -MMD -MP -MF"src/ROV_Controller_Prototype.d" -MT"src/ROV_Controller_Prototype.o" -MT"src/ROV_Controller_Prototype.d" -o "src/ROV_Controller_Prototype.o" "../src/ROV_Controller_Prototype.c"
+Finished building: ../src/ROV_Controller_Prototype.c
+ 
+Building target: ROV_Controller_Prototype.axf
+Invoking: MCU Linker
+arm-none-eabi-gcc -nostdlib -L"C:\Users\Joey\Documents\LPCXpresso_8.2.2_650\MATE_Workspace\wstest\lpc_board_nxp_lpcxpresso_1769\Debug" -L"C:\Users\Joey\Documents\LPCXpresso_8.2.2_650\MATE_Workspace\wstest\lpc_chip_175x_6x\Debug" -Xlinker -Map="ROV_Controller_Prototype.map" -Xlinker --gc-sections -Xlinker -print-memory-usage -mcpu=cortex-m3 -mthumb -T "ROV_Controller_Prototype_Debug.ld" -o "ROV_Controller_Prototype.axf"  ./src/ROV_Controller_Prototype.o ./src/cr_startup_lpc175x_6x.o ./src/crp.o ./src/sysinit.o   -llpc_board_nxp_lpcxpresso_1769 -llpc_chip_175x_6x
+Memory region         Used Size  Region Size  %age Used
+       MFlash512:        7812 B       512 KB      1.49%
+        RamLoc32:         316 B        32 KB      0.96%
+        RamAHB32:          0 GB        32 KB      0.00%
+Finished building target: ROV_Controller_Prototype.axf
+ 
+make --no-print-directory post-build
+Performing post-build steps
+arm-none-eabi-size "ROV_Controller_Prototype.axf"; # arm-none-eabi-objcopy -v -O binary "ROV_Controller_Prototype.axf" "ROV_Controller_Prototype.bin" ; # checksum -p LPC1769 -d "ROV_Controller_Prototype.bin";
+   text	   data	    bss	    dec	    hex	filename
+   7752	     60	    256	   8068	   1f84	ROV_Controller_Prototype.axf
+ 
+
+16:48:18 Build Finished (took 1s.136ms)
+
