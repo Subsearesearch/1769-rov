@@ -50,8 +50,13 @@
 #include "httpd.h"
 #include "lwip_fs.h"
 
+#include "BNO055.h"
+
+#include <math.h>
+
 #include <string.h>
 #include <ctype.h>
+#include <stdlib.h>
 
 //#define MICRO2 1
 
@@ -86,7 +91,20 @@
 #define PCLK_PWM1_BY8	((1<<13)|(1<<12))
 #define PCLK_PWM1_BY4	~(PCLK_PWM1_BY8)
 
-#define MAXPW	200u
+#define MAXPW	200
+
+#define SPEED_100KHZ         100000
+
+#define QW	0
+#define QX	1
+#define QY	2
+#define QZ	3
+
+#define BNO055_SAMPLERATE_DELAY_MS (100)
+#define dt BNO055_SAMPLERATE_DELAY_MS
+
+//Fixed decimal point (2^DEC_PT).
+#define DEC_PT	(int64_t) (1<<14)
 
 /*****************************************************************************
  * Private types/enumerations/variables
@@ -105,10 +123,183 @@ extern char ROVparams[];
 extern char ROVparam_vals[];
 extern char http_index_html[];
 extern Bool toggle;
+extern uint16_t htmlSize;
+
+uint32_t WDP[] = {4, 28};
+static int mode_poll;   /* Poll/Interrupt mode flag */
+static I2C_XFER_T xfer;
+//uint8_t message[] = "\0Joey was here.";
+
+//Quaternion.
+typedef struct {
+	int32_t w;
+	int32_t x;
+	int32_t y;
+	int32_t z;
+} Quat;
+
+//Bigger quaternion for fixed point multiplication.
+typedef struct {
+	int64_t w;
+	int64_t x;
+	int64_t y;
+	int64_t z;
+} Quat64;
+
+//Axis angle
+typedef struct {
+	int32_t w;
+	int32_t x;
+	int32_t y;
+	int32_t z;
+} AxisAngle;
+
+//Bigger axis angle
+typedef struct {
+	int64_t w;
+	int64_t x;
+	int64_t y;
+	int64_t z;
+} AxisAngle64;
 
 /*****************************************************************************
  * Private functions
  ****************************************************************************/
+
+/* Set I2C mode to polling/interrupt */
+static void i2c_set_mode(I2C_ID_T id, int polling)
+{
+	if(!polling) {
+		mode_poll &= ~(1 << id);
+		Chip_I2C_SetMasterEventHandler(id, Chip_I2C_EventHandler);
+		NVIC_EnableIRQ(id == I2C0 ? I2C0_IRQn : I2C1_IRQn);
+	} else {
+		mode_poll |= 1 << id;
+		NVIC_DisableIRQ(id == I2C0 ? I2C0_IRQn : I2C1_IRQn);
+		Chip_I2C_SetMasterEventHandler(id, Chip_I2C_EventHandlerPolling);
+	}
+}
+
+/* Initialize the I2C bus */
+static void i2c_app_init(I2C_ID_T id, int speed)
+{
+	Board_I2C_Init(id);
+
+	/* Initialize I2C */
+	Chip_I2C_Init(id);
+	Chip_I2C_SetClockRate(id, speed);
+
+	/* Set default mode to interrupt */
+	i2c_set_mode(id, 0);
+}
+
+//Delay. Dependant upon clock speed.
+void _delay_ms (uint16_t ms)
+{
+ uint16_t delay;
+ volatile uint32_t i;
+ for (delay = ms; delay >0 ; delay--)
+//1ms loop with -Os optimisation
+  {
+  for (i=3500; i >0;i--){};
+  }
+}
+
+//Convert a byte to a string.
+void hexToStr (uint8_t hex, char *string) {
+	string[0] = "0123456789ABCDEF"[(hex & 0xF0)>>4];
+	string[1] = "0123456789ABCDEF"[hex & 0x0F];
+}
+
+//Send bytes to the IMU using I2C.
+void writeIMU(uint8_t regAddr, const uint8_t *data, uint8_t number) {
+
+	uint8_t TXbuf[number + 1];
+
+	TXbuf[0] = regAddr;
+
+	memcpy((char *) (TXbuf + 1), (char *) data, number * sizeof(uint8_t));
+
+//	xfer.rxBuff = (uint8_t *) http_index_html;
+	xfer.rxSz = 0x00;
+	xfer.slaveAddr = IMU_ADDR;
+	xfer.txBuff = TXbuf;
+	xfer.txSz = (int) number + 1;
+
+	Chip_I2C_MasterTransfer(I2C1, &xfer);
+}
+
+//Send a single byte to the IMU.
+void writeIMUbyte(uint8_t regAddr, const uint8_t data) {
+
+	uint8_t dataOut[2];
+
+	dataOut[0] = regAddr;
+	dataOut[1] = data;
+
+	xfer.rxSz = 0;
+	xfer.slaveAddr = IMU_ADDR;
+	xfer.txBuff = dataOut;
+	xfer.txSz = 2;
+
+	Chip_I2C_MasterTransfer(I2C1, &xfer);
+}
+
+//Read a single byte from the IMU.
+uint8_t readIMUbyte(uint8_t regAddr) {
+
+	uint8_t dataIn;
+
+	xfer.rxBuff = &dataIn;
+	xfer.rxSz = 1;
+	xfer.slaveAddr = IMU_ADDR;
+	xfer.txBuff = &regAddr;
+	xfer.txSz = 1;
+
+	Chip_I2C_MasterTransfer(I2C1, &xfer);
+
+	return dataIn;
+}
+
+//Read bytes from the IMU.
+void readIMU(uint8_t regAddr, uint8_t *data, uint8_t number) {
+
+	xfer.rxBuff = data;
+	xfer.rxSz = number;
+	xfer.slaveAddr = IMU_ADDR;
+	xfer.txBuff = &regAddr;
+	xfer.txSz = 1;
+
+	Chip_I2C_MasterTransfer(I2C1, &xfer);
+}
+
+//Setup IMU.
+uint8_t initIMU() {
+
+	uint8_t selfTest = 0;
+
+//	//Reset IMU.
+//	_delay_ms(700);
+//	writeIMUbyte(SYS_TRIGGER, RST_SYS);
+//	_delay_ms(1000);
+
+	//Check to make sure that the IMU passed its self test.
+	selfTest = readIMUbyte(ST_RESULT);
+
+	//Axis Remap.
+	writeIMUbyte(AXIS_MAP_CONFIG, (X_TO_X | Y_TO_Y | Z_TO_Z));
+	//Axis Sign.
+	writeIMUbyte(AXIS_MAP_SIGN, (POS_X_AXIS | POS_Y_AXIS | POS_Z_AXIS));
+
+	//Temp units = C.
+	writeIMUbyte(UNIT_SEL, (Windows | DegreesC | MetersPerSec2));
+
+	//Start IMU.
+	writeIMUbyte(OPR_MODE, NDOF);
+	_delay_ms(10);	//Wait for IMU to switch modes.
+
+	return selfTest;
+}
 
 /* Sets up system hardware */
 static void prvSetupHardware(void)
@@ -117,9 +308,18 @@ static void prvSetupHardware(void)
 	SystemCoreClockUpdate();
 	Board_Init();
 
+	i2c_app_init(I2C1, SPEED_100KHZ);
+
+	//Set water detection pin.
+	Chip_GPIO_SetPinDIRInput(LPC_GPIO, WDP[0], WDP[1]);
+
 	/* Initial LED state is off to show an unconnected cable state */
 	Board_LED_Set(0, false);
 	Board_LED_Set(1, false);
+
+	//Initialize IMU.
+	initIMU();
+
 	/* Setup a 1mS sysTick for the primary time base */
 	SysTick_Enable(1);
 
@@ -194,10 +394,12 @@ uint32_t to32(uint16_t twoByte) {
 	}
 }
 
+//Reads a bit from the button byte in the command.
 Bool button(uint16_t *cmd, uint8_t bit) {
 	return (cmd[BTN] & (1<<bit)) != 0;
 }
 
+//Converts hexadecimal characters to an integer.
 uint8_t ToInt(char *byte, const uint8_t index) {
 	uint8_t data;
 
@@ -228,6 +430,206 @@ uint8_t ToInt(char *byte, const uint8_t index) {
 	return data;
 }
 
+/* State machine handler for I2C0 and I2C1 */
+static void i2c_state_handling(I2C_ID_T id)
+{
+	if (Chip_I2C_IsMasterActive(id)) {
+		Chip_I2C_MasterStateHandler(id);
+	} else {
+		Chip_I2C_SlaveStateHandler(id);
+	}
+}
+
+/**
+ * @brief	I2C Interrupt Handler
+ * @return	None
+ */
+void I2C1_IRQHandler(void)
+{
+	i2c_state_handling(I2C1);
+}
+
+//I think that this is an old function that was intended to show a compass on the monitor.
+void ToCompass(uint16_t *quat, char * comp) {
+
+	strcpy(comp,
+			"     \r\n"
+			"     \r\n"
+			"  O  \r\n"
+			"     \r\n"
+			"     \r\n"
+	);
+
+	uint16_t quatZ = quat[QZ];
+
+	if (quatZ > 0) {
+		comp[5 * 7 + 3] = '-';
+		comp[5 * 7 + 4] = '>';
+	} else {
+		comp[5 * 7 + 1] = '-';
+		comp[5 * 7] = '<';
+	}
+}
+
+//Converts a Quat to a Quat64.
+void toQuat64(Quat64 *qo, Quat *qi) {
+	(*qo).w = (int64_t) (*qi).w;
+	(*qo).x = (int64_t) (*qi).x;
+	(*qo).y = (int64_t) (*qi).y;
+	(*qo).z = (int64_t) (*qi).z;
+}
+
+//Converts a Quat64 to a Quat.
+void toQuat32(Quat *qo, Quat64 *qi) {
+	(*qo).w = (int32_t) (*qi).w;
+	(*qo).x = (int32_t) (*qi).x;
+	(*qo).y = (int32_t) (*qi).y;
+	(*qo).z = (int32_t) (*qi).z;
+}
+
+//Hamilton product of two quaternions.
+void Qham(Quat *y, Quat *a, Quat *b) {
+
+	Quat64 transfer;
+	Quat64 a64;
+	Quat64 b64;
+
+	toQuat64(&a64, a);
+	toQuat64(&b64, b);
+
+	transfer.w = ((a64.w * b64.w) - (a64.x * b64.x) - (a64.y * b64.y) - (a64.z * b64.z)) / DEC_PT;
+	transfer.x = ((a64.w * b64.x) + (a64.x * b64.w) + (a64.y * b64.z) - (a64.z * b64.y)) / DEC_PT;
+	transfer.y = ((a64.w * b64.y) - (a64.x * b64.z) + (a64.y * b64.w) + (a64.z * b64.x)) / DEC_PT;
+	transfer.z = ((a64.w * b64.z) + (a64.x * b64.y) - (a64.y * b64.x) + (a64.z * b64.w)) / DEC_PT;
+
+	toQuat32(y, &transfer);
+}
+
+//Conjugate of a quaternion.
+void Qconj(Quat *qo, Quat *qi) {
+	(*qo).w = (*qi).w;
+	(*qo).x = -(*qi).x;
+	(*qo).y = -(*qi).y;
+	(*qo).z = -(*qi).z;
+}
+
+//Returns the square of the norm of a quaternion.
+int32_t QnormSqr(Quat *q) {
+
+	Quat64 q64;
+
+	toQuat64(&q64, q);
+
+	return (int32_t) (((q64.w * q64.w) + (q64.x * q64.x) + (q64.y * q64.y) + (q64.z * q64.z)) / DEC_PT);
+}
+
+//Convert uint16_t to int32_t.
+int32_t U16toS32(uint16_t twoByte) {
+	return ((twoByte & (1<<15)) > 0) ? -((int32_t) ((~(twoByte) + 1) & 0xFFFF)) : (int32_t) twoByte;
+}
+
+int32_t sqrtFix(int64_t n) {
+
+	int64_t a = 1;
+	int64_t b = n;
+
+	while (abs(a - b) > 1) {
+		b = n / a;
+		a = (a + b) / 2;
+	}
+
+	return (int32_t) (a * 128);
+}
+
+int32_t Qnorm(Quat *q) {
+	Quat64 q64;
+
+	toQuat64(&q64, q);
+
+	return (int32_t) sqrtFix(((q64.w * q64.w) + (q64.x * q64.x) + (q64.y * q64.y) + (q64.z * q64.z)) / DEC_PT);
+}
+
+void Qnormalize(Quat *qo, Quat *qi) {
+
+	int32_t norm = Qnorm(qi);
+
+	(*qo).w = (*qi).w / norm;
+	(*qo).x = (*qi).x / norm;
+	(*qo).y = (*qi).y / norm;
+	(*qo).z = (*qi).z / norm;
+}
+
+
+//Converts a Quat to a Quat64.
+void toAxis64(AxisAngle64 *ao, AxisAngle *ai) {
+	(*ao).x = (int64_t) (*ai).x;
+	(*ao).y = (int64_t) (*ai).y;
+	(*ao).z = (int64_t) (*ai).z;
+}
+
+//Converts a Quat64 to a Quat.
+void toAxis32(AxisAngle *ao, AxisAngle64 *ai) {
+	(*ao).x = (int32_t) (*ai).x;
+	(*ao).y = (int32_t) (*ai).y;
+	(*ao).z = (int32_t) (*ai).z;
+}
+
+int32_t Anorm(AxisAngle *a) {
+
+	AxisAngle64 a64;
+
+	toAxis64(&a64, a);
+
+	return (int32_t) sqrtFix(((a64.x * a64.x) + (a64.y * a64.y) + (a64.z * a64.z)) / DEC_PT);
+}
+
+void Anormalize(AxisAngle *ao, AxisAngle *ai) {
+
+	int32_t norm = Anorm(ai);
+
+	(*ao).x = (*ai).x / norm;
+	(*ao).y = (*ai).y / norm;
+	(*ao).z = (*ai).z / norm;
+}
+
+int32_t sinFix(int32_t n) {
+	return n;
+}
+
+int32_t cosFix(int32_t n) {
+	return n;
+}
+
+int32_t axisToQuat(Quat *q, AxisAngle *a) {
+	AxisAngle one;
+
+	Anormalize(&one, a);
+
+	int32_t angle;
+
+
+    if ((*a).x == 0) {
+        if ((*a).y == 0) {
+            if ((*a).z == 0) {
+                angle = 0;
+            } else {
+                angle = (*a).z / one.z;
+            }
+        } else {
+            angle = (*a).y / one.y;
+        }
+    } else {
+        angle = (*a).x / one.x;
+    }
+
+    (*q).w = cosFix(angle / 2);
+    (*q).x = one.x * sinFix(angle / 2);
+    (*q).y = one.y * sinFix(angle / 2);
+    (*q).z = one.z * sinFix(angle / 2);
+
+    return angle;
+}
+
 /*****************************************************************************
  * Public functions
  ****************************************************************************/
@@ -243,16 +645,31 @@ int main(void)
 	ip_addr_t ipaddr, netmask, gw;
 	static int prt_ip = 0;
 
-	uint16_t cmd[7];
+	uint8_t temp[0x10];
+	char tempStr[16] = "";
+
+	//Thruster control variables.
+	uint16_t cmd[7] = {0, 0, 0, 0, 0, 0, 0};
 	Bool started = false;
-	uint32_t thruster[6];
+	uint32_t thruster[] = {0, 0, 0, 0, 0, 0};
 
+	int16_t euler[] = {0, 0, 0};
+	int16_t quat[] = {0, 0, 0, 0};
+	int16_t rotVel[] = {0, 0, 0};
 
-//	ROVparams[0] = (char *) malloc(sizeof(char *) * 16);
-//	ROVparam_vals[0] = (char *) malloc(sizeof(char *) * 16);
-//
-//	memset(ROVparams, 0, sizeof(char *) * 16);
-//	memset(ROVparam_vals, 0, sizeof(char *) * 16);
+	Quat error;
+	Quat measured_value = {.w = 0, .x = 0, .y = 0, .z = 0};
+	Quat output = {.w = 0, .x = 0, .y = 0, .z = 0};
+	Quat setpoint = {.w = 0, .x = 0, .y = 0, .z = 0};
+	Quat velocity = {.w = 0, .x = 0, .y = 0, .z = 0};
+	int32_t Pq[] = {20, 20, 20};
+	int32_t Pw[] = {4, 4, 4};
+//	uint8_t id;
+
+	for (uint16_t i = 0; i < htmlSize; i++) {
+
+		http_index_html[i] = '\0';
+	}
 
 	ROVparams[0] = '\0';
 	ROVparam_vals[0] = '\0';
@@ -374,51 +791,268 @@ int main(void)
 			}
 		}
 
-		//Turn character string into an integer array.
-		for (uint8_t i = 0; i < 7; i++) {
-			cmd[i] = ToInt(ROVparam_vals, i * 4)<<8;
-			cmd[i] |= ToInt(ROVparam_vals, (i * 4) + 2);
+		//Read quaternion data.
+		readIMU(QUA_DATA_W_LSB, temp, 8);
+
+		//Put quaternion data into array.
+		for (uint8_t i = 0; i < 4; i++) {
+
+			quat[i] = (int16_t) temp[2 * i];
+			quat[i] |= (int16_t) temp[2 * i + 1]<<8;
+			quat[i] = ((quat[2 * i + 1]>>7) > 0) ? -(~quat[i] + 1) : quat[i];
 		}
+
+		//Move the orientation array into a quaternion.
+		measured_value.w = (int32_t) quat[0];
+		measured_value.x = (int32_t) quat[1];
+		measured_value.y = (int32_t) quat[2];
+		measured_value.z = (int32_t) quat[3];
 
 		//Buttons
 		if ((strcmp(ROVparams, "ROV") == 0) && toggle) {
 
-			//Start ROV.
-			if (button(cmd, 0)) {
-				started = true;
-
-				strcpy(http_index_html,     "Started.            ");
+			for (char *i = http_index_html; *i != '\0'; i++) {
+				*i = '\0';
 			}
 
-			//LED
+			strcat(http_index_html, "{");
+
+			//Water detection.
+			strcat(http_index_html, "\"Water\": \"");
+
+			if (Chip_GPIO_GetPinState(LPC_GPIO, WDP[0], WDP[1]) == FALSE) {
+
+				strcat(http_index_html, "Detected\",");
+
+			} else {
+				strcat(http_index_html, "Safe\",");
+			}
+
+			//Start ROV.
+			strcat(http_index_html, "\"Started\" : \"");
+
+			if (button(cmd, 0) || (started == TRUE)) {
+				started = TRUE;
+				strcat(http_index_html, "True\",");
+			} else {
+				strcat(http_index_html, "False\",");
+			}
+
 			if (!button(cmd, 2) && button(cmd, 1)) {
 				Board_LED_Toggle(BLUELED);
+			}
 
-				if (Board_LED_Test(BLUELED)) {
-					strcpy(http_index_html, "The blue LED is on. ");
-				} else {
-					strcpy(http_index_html, "The blue LED is off.");
+			if (button(cmd, 2) && button(cmd, 1)) {
+				Board_LED_Set(BLUELED, true);
+
+			}
+
+			if (button(cmd, 2) && !button(cmd, 1)) {
+				Board_LED_Set(BLUELED, FALSE);
+			}
+
+			//IMU.
+			strcat(http_index_html, "\"IMU\": \"");
+
+			if (button(cmd, 3)) {
+
+				strcat(http_index_html, "Enabled\",");
+
+				strcat(http_index_html, "\"Euler\": [");
+
+				//Read Euler data.
+				readIMU(EUL_DATA_X_LSB, temp, 6);
+
+				//Put Euler data into array.
+				for (uint8_t i = 0; i < 3; i++) {
+
+					euler[i] = (int16_t) temp[2 * i];
+					euler[i] |= (int16_t) temp[2 * i + 1]<<8;
+					euler[i] = ((euler[2 * i + 1]>>7) > 0) ? -(~euler[i] + 1) : euler[i];
+
+					itoa(euler[i], tempStr, 10);
+					strcat(http_index_html, tempStr);
+
+					if (i < 2) {
+						strcat(http_index_html, ", ");
+					}
 				}
 
-			} else if (button(cmd, 2) && button(cmd, 1)) {
-				Board_LED_Set(BLUELED, true);
-				strcpy(http_index_html, "The blue LED is on. ");
+				strcat(http_index_html, "],\"Quat\": [");
 
-			} else if (button(cmd, 2) && !button(cmd, 1)) {
-				Board_LED_Set(BLUELED, false);
-				strcpy(http_index_html, "The blue LED is off.");
+				//Put quaternion data into array.
+				for (uint8_t i = 0; i < 4; i++) {
+
+					itoa(quat[i], tempStr, 10);
+					strcat(http_index_html, tempStr);
+
+					if (i < 3) {
+						strcat(http_index_html, ", ");
+					}
+				}
+
+				//Read rotational velocity data.
+				readIMU(GYR_DATA_X_LSB, temp, 6);
+
+				strcat(http_index_html, "],\"Rotational_Velocity\": [");
+
+				//Put rotational velocity data into array.
+				for (uint8_t i = 0; i < 3; i++) {
+
+					rotVel[i] = (int16_t) temp[2 * i];
+					rotVel[i] |= (int16_t) temp[2 * i + 1]<<8;
+					rotVel[i] = ((rotVel[2 * i + 1]>>7) > 0) ? -(~rotVel[i] + 1) : rotVel[i];
+
+					itoa(rotVel[i], tempStr, 10);
+					strcat(http_index_html, tempStr);
+
+					if (i < 2) {
+						strcat(http_index_html, ", ");
+					}
+				}
+
+				//Send IMU calibration to the Raspberry Pi.
+				strcat(http_index_html, "],\"Calibration\": ");
+
+				readIMU(CALIB_STAT, temp, 1);
+				itoa(temp[0], tempStr, 10);
+				strcat(http_index_html, tempStr);
+
+				//The square of the norm should be about 16384.
+				strcat(http_index_html, ",\"Norm_Squared\": ");
+
+				itoa((int) QnormSqr(&measured_value), tempStr, 10);
+//				itoa(sizeof(int16_t), tempStr, 10);
+				strcat(http_index_html, tempStr);
+				strcat(http_index_html, ", ");
+
+				strcat(http_index_html, "\"Output\": [");
+
+				itoa(output.x, tempStr, 10);
+				strcat(http_index_html, tempStr);
+				strcat(http_index_html, ", ");
+
+				itoa(output.y, tempStr, 10);
+				strcat(http_index_html, tempStr);
+				strcat(http_index_html, ", ");
+
+				itoa(output.z, tempStr, 10);
+				strcat(http_index_html, tempStr);
+
+				strcat(http_index_html, "],");
+
+			} else {
+				strcat(http_index_html, "Disabled\",\"Euler\": [0, 0, 0],\"Quat\": [0, 0, 0, 0],\"Rotational_Velocity\": [0, 0, 0],\"Calibration\": 0,\"Norm_Squared\": 0,\"Output\": [0, 0, 0],");
 			}
-			toggle = false;
+
+			strcat(http_index_html, "\"PWM\": [");
+
+			for (int i = 0; i < 6; i++) {
+
+				itoa(thruster[i], tempStr, 10);
+				strcat(http_index_html, tempStr);
+
+				if (i < 5) {
+					strcat(http_index_html, ",");
+				}
+			}
+
+			strcat(http_index_html, "],");
+
+			strcat(http_index_html, "\"LED\": ");
+
+			if (Board_LED_Test(BLUELED)) {
+				strcat(http_index_html, "\"On\"");
+			} else {
+				strcat(http_index_html, "\"Off\"");
+			}
+
+			//Turn character string into an integer array.
+			for (uint8_t i = 0; i < 7; i++) {
+				cmd[i] = ToInt(ROVparam_vals, i * 4)<<8;
+				cmd[i] |= ToInt(ROVparam_vals, (i * 4) + 2);
+			}
+
+			strcat(http_index_html, "}");
+
+			toggle = FALSE;
 		}
 
-		//convert data.
-		thruster[FRT] = 1500u + multDiv(multDiv((neg(to32(cmd[TX])) + to32(cmd[TY]) + neg(to32(cmd[RZ]))), MAXPW, '*'), (0x8000u), '/');
-		thruster[FLT] = 1500u + multDiv(multDiv((to32(cmd[TX]) + to32(cmd[TY]) + to32(cmd[RZ])), MAXPW, '*'), (0x8000u), '/');
-		thruster[BRT] = 1500u + multDiv(multDiv((to32(cmd[TX]) + to32(cmd[TY]) + neg(to32(cmd[RZ]))), MAXPW, '*'), (0x8000u), '/');
-		thruster[BLT] = 1500u + multDiv(multDiv((neg(to32(cmd[TX])) + to32(cmd[TY]) + to32(cmd[RZ])), MAXPW, '*'), (0x8000u), '/');
+		//Only use the output quaternion if the IMU is enabled.
+		if (button(cmd, 3)) {
 
-		thruster[RVT] = 1500u + neg(multDiv(multDiv((neg(to32(cmd[TZ])) + to32(cmd[RY])), MAXPW, '*'), (0x8000u), '/'));
-		thruster[LVT] = 1500u + neg(multDiv(multDiv((neg(to32(cmd[TZ])) + neg(to32(cmd[RY]))), MAXPW, '*'), (0x8000u), '/'));
+			//Read Euler data.
+			readIMU(EUL_DATA_X_LSB, temp, 6);
+
+			//Put Euler data into array.
+			for (uint8_t i = 0; i < 3; i++) {
+
+				euler[i] = (int16_t) temp[2 * i];
+				euler[i] |= (int16_t) temp[2 * i + 1]<<8;
+				euler[i] = ((euler[2 * i + 1]>>7) > 0) ? -(~euler[i] + 1) : euler[i];
+			}
+
+			//Read rotational velocity data.
+			readIMU(GYR_DATA_X_LSB, temp, 6);
+
+			//Put rotational velocity data into array.
+			for (uint8_t i = 0; i < 3; i++) {
+
+				rotVel[i] = (int16_t) temp[2 * i];
+				rotVel[i] |= (int16_t) temp[2 * i + 1]<<8;
+				rotVel[i] = ((rotVel[2 * i + 1]>>7) > 0) ? -(~rotVel[i] + 1) : rotVel[i];
+			}
+
+			//Move the rotational velocity array into a quaternion.
+			velocity.x = (int32_t) rotVel[0];
+			velocity.y = (int32_t) rotVel[1];
+			velocity.z = (int32_t) rotVel[2];
+
+			//TODO Convert rotation command to quaternion.
+
+			//Calculate error.
+			Qconj(&error, &measured_value);
+			Qham(&error, &setpoint, &error);
+
+			//Amplify error and mix with rotational velocity.
+			output.x = ((-Pq[0] * error.x) - (Pw[0] * velocity.x)) * ((error.w < 0) ? -1 : 1);
+			output.y = ((-Pq[1] * error.y) - (Pw[1] * velocity.y)) * ((error.w < 0) ? -1 : 1);
+			output.z = ((-Pq[2] * error.z) - (Pw[2] * velocity.z)) * ((error.w < 0) ? -1 : 1);
+
+			//Prevent underflow during conversion to uint32_t and keep output between the max and min pulse-widths.
+//			output.x = ((output.x < 0) ? 0 : output.x);
+//			output.x = ((output.x > 0) ? MAXPW : output.x);
+//			output.y = ((output.y < 0) ? 0 : output.y);
+//			output.y = ((output.y > MAXPW) ? MAXPW : output.y);
+//			output.z = ((output.z < 0) ? 0 : output.z);
+//			output.z = ((output.z > MAXPW) ? MAXPW : output.z);
+
+			//TODO Convert output rotation to thruster pulse width.
+			thruster[FRT] = (uint32_t) 1500 + ((-U16toS32(cmd[TX]) + U16toS32(cmd[TY]) - output.z) * MAXPW / 0x8000);
+			thruster[FLT] = (uint32_t) 1500 + ((U16toS32(cmd[TX]) + U16toS32(cmd[TY]) + output.z) * MAXPW / 0x8000);
+			thruster[BRT] = (uint32_t) 1500 + ((U16toS32(cmd[TX]) + U16toS32(cmd[TY]) - output.z) * MAXPW / 0x8000);
+			thruster[BLT] = (uint32_t) 1500 + ((-U16toS32(cmd[TX]) + U16toS32(cmd[TY]) + output.z) * MAXPW / 0x8000);
+
+			thruster[RVT] = (uint32_t) 1500 - ((-U16toS32(cmd[TZ]) + output.y) * MAXPW / 0x8000);
+			thruster[LVT] = (uint32_t) 1500 - ((-U16toS32(cmd[TZ]) - output.y) * MAXPW / 0x8000);
+
+		} else {
+
+			//Set the setpoint to the direction that the ROV is already pointing in.
+			setpoint.w = measured_value.w;
+			setpoint.x = measured_value.x;
+			setpoint.y = measured_value.y;
+			setpoint.z = measured_value.z;
+
+			//Convert command to data.
+			thruster[FRT] = (uint32_t) 1500 + ((-U16toS32(cmd[TX]) + U16toS32(cmd[TY]) - U16toS32(cmd[RZ])) * MAXPW / 0x8000);
+			thruster[FLT] = (uint32_t) 1500 + ((U16toS32(cmd[TX]) + U16toS32(cmd[TY]) + U16toS32(cmd[RZ])) * MAXPW / 0x8000);
+			thruster[BRT] = (uint32_t) 1500 + ((U16toS32(cmd[TX]) + U16toS32(cmd[TY]) - U16toS32(cmd[RZ])) * MAXPW / 0x8000);
+			thruster[BLT] = (uint32_t) 1500 + ((-U16toS32(cmd[TX]) + U16toS32(cmd[TY]) + U16toS32(cmd[RZ])) * MAXPW / 0x8000);
+
+			thruster[RVT] = (uint32_t) (1500 - ((-U16toS32(cmd[TZ]) + U16toS32(cmd[RY])) * MAXPW / 0x8000));
+			thruster[LVT] = (uint32_t) (1500 - ((-U16toS32(cmd[TZ]) - U16toS32(cmd[RY])) * MAXPW / 0x8000));
+		}
 
 		if (started) {
 

@@ -65,7 +65,8 @@ example/src/webserver.o example/src/webserver.d: \
  C:\Users\Joey\Documents\LPCXpresso_8.2.2_650\MATE_Workspace\wstest\lpc_board_nxp_lpcxpresso_1769\inc/lpc_phy.h \
  C:\Users\Joey\Documents\LPCXpresso_8.2.2_650\MATE_Workspace\wstest\webserver\lwip\inc/arch/lpc17xx_40xx_emac.h \
  C:\Users\Joey\Documents\LPCXpresso_8.2.2_650\MATE_Workspace\wstest\webserver\lwip\inc/arch/lpc_arch.h \
- ../example/src/httpd.h ../example/src/lwip_fs.h
+ ../example/src/httpd.h ../example/src/lwip_fs.h \
+ C:\Users\Joey\Documents\LPCXpresso_8.2.2_650\MATE_Workspace\wstest\webserver\example\inc/BNO055.h
 
 C:\Users\Joey\Documents\LPCXpresso_8.2.2_650\MATE_Workspace\wstest\webserver\lwip\inc/lwip/init.h:
 
@@ -200,3 +201,5 @@ C:\Users\Joey\Documents\LPCXpresso_8.2.2_650\MATE_Workspace\wstest\webserver\lwi
 ../example/src/httpd.h:
 
 ../example/src/lwip_fs.h:
+
+C:\Users\Joey\Documents\LPCXpresso_8.2.2_650\MATE_Workspace\wstest\webserver\example\inc/BNO055.h:

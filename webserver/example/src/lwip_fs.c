@@ -51,10 +51,14 @@
  * Private types/enumerations/variables
  ****************************************************************************/
 
+#define HTML_SIZE	512
+
+uint16_t htmlSize = HTML_SIZE;
+
 /* Default html file */
-char http_index_html[128];
+char http_index_html[HTML_SIZE];
 #ifndef SECTOR_SZ
-#define SECTOR_SZ 512
+#define SECTOR_SZ HTML_SIZE * 2
 #endif
 
 #if defined(LWIP_FATFS_SUPPORT)
@@ -179,7 +183,8 @@ struct fs_file *fs_open_default(void) {
 	hlen = get_http_headers("default.htm", (char *) fds->scratch);
 	fs->data = (const char *) fds->scratch;
 	memcpy((void *) &fs->data[hlen], (void *) http_index_html, sizeof(http_index_html) - 1);
-	fs->len = hlen + sizeof(http_index_html) - 1;
+//	fs->len = hlen + sizeof(http_index_html) - 1; Joey
+	fs->len = hlen + strlen(http_index_html);
 	fs->index = fs->len;
 	fs->http_header_included = 1;
 	return fs;
